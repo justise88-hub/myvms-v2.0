@@ -1,0 +1,6 @@
+<RCC>
+  <qresource prefix="/branding">
+    <file alias="psvms.png">PSVMS_icon.png</file>
+    <file alias="citywallpaper.png">citywallpaper.png</file>
+  </qresource>
+</RCC>
