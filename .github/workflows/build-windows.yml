@@ -1,0 +1,48 @@
+
+name: Build PSVMS for Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.1'
+          arch: 'win64_msvc2022_64'
+          modules: 'qtmultimedia'
+          cache: true
+
+      # FFmpeg is built from source; the first run may take 20–40 minutes.
+      - name: Install FFmpeg and OpenSSL (vcpkg)
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install "ffmpeg[core,avcodec,avformat]:x64-windows" openssl:x64-windows
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR" `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Collect Qt libraries next to the exe
+        shell: pwsh
+        run: |
+          & "$env:QT_ROOT_DIR\bin\windeployqt.exe" --release --no-translations build\Release\PSVMS.exe
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: PSVMS-windows
+          path: build/Release/
