@@ -3033,7 +3033,7 @@ QString CameraManager::add(CameraEntry e)
 {
     if (!Users::current().isAdmin()) { SecurityAudit::write(QStringLiteral("permission_denied"), QStringLiteral("camera.add")); return QString(); }
     // Не допускаем повторное добавление одного и того же устройства.
-    const QString candidateUrl = e.url.toString(QUrl::FullyEncoded).trimmed().toLower();
+    const QString candidateUrl = QUrl(e.url).toString(QUrl::FullyEncoded).trimmed().toLower();
     for (const CameraEntry &existing : m_cameras) {
         const QString existingUrl = QUrl(existing.url).toString(QUrl::FullyEncoded).trimmed().toLower();
         if (!candidateUrl.isEmpty() && candidateUrl == existingUrl) {
