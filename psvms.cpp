@@ -701,6 +701,7 @@ private:
 // MIME-типы перетаскивания
 inline constexpr const char *kCameraMime = "application/x-psvms-camera";   // камера из списка в ячейку
 inline constexpr const char *kCellMime = "application/x-psvms-cell";       // ячейка на другую ячейку (обмен местами)
+inline constexpr const char *kGroupMime = "application/x-psvms-camera-group"; // группа камер
 
 // ======================================================================
 // app/camera_tree.h
@@ -714,15 +715,21 @@ public:
 protected:
     QMimeData *mimeData(const QList<QTreeWidgetItem *> &items) const override
     {
-        for (const QTreeWidgetItem *it : items) {
-            const QString id = it->data(0, Qt::UserRole).toString();
-            if (!id.isEmpty()) {
-                auto *m = new QMimeData;
-                m->setData(QString::fromLatin1(kCameraMime), id.toUtf8());
-                return m;
-            }
-        }
-        return nullptr;
+        QStringList ids;
+        auto collect = [&ids](const QTreeWidgetItem *root, auto &&collectRef) -> void {
+            const QString id = root->data(0, Qt::UserRole).toString();
+            if (!id.isEmpty() && !ids.contains(id)) ids.append(id);
+            for (int i = 0; i < root->childCount(); ++i)
+                collectRef(root->child(i), collectRef);
+        };
+        for (const QTreeWidgetItem *it : items) collect(it, collect);
+        if (ids.isEmpty()) return nullptr;
+        auto *m = new QMimeData;
+        if (ids.size() == 1)
+            m->setData(QString::fromLatin1(kCameraMime), ids.first().toUtf8());
+        else
+            m->setData(QString::fromLatin1(kGroupMime), ids.join(QLatin1Char('\n')).toUtf8());
+        return m;
     }
 };
 
@@ -1587,6 +1594,7 @@ public:
 
 protected:
     void showEvent(QShowEvent *e) override;
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 private slots:
     void reloadCameras();
@@ -1609,6 +1617,8 @@ private:
     QPushButton *m_playBtn = nullptr;
     QSlider *m_slider = nullptr;
     QLabel *m_time = nullptr;
+    QVBoxLayout *m_videoLayout = nullptr;
+    QPointer<QDialog> m_videoFullscreen;
 };
 
 // ======================================================================
@@ -1881,9 +1891,9 @@ QPushButton#navItem:hover, QPushButton#navBottomItem:hover, QPushButton#navLang:
  color:#fff1c7; background:rgba(184,135,44,100); border-color:rgba(236,193,103,190);
 }
 QPushButton#navItem:checked {
- color:#1b160c; font-weight:850;
- background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 rgba(255,225,151,245),stop:0.55 rgba(211,163,68,235),stop:1 rgba(130,88,27,225));
- border:1px solid #ffe2a0;
+ color:#fff0bf; font-weight:650;
+ background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #34302a,stop:0.55 #292722,stop:1 #22211e);
+ border:1px solid #c69c45;
 }
 QPushButton#navBottomItem[prominent="true"] { color:#f3d17c; background:rgba(155,108,33,55); border:1px solid rgba(215,170,80,150); min-height:46px; font-weight:750; }
 QFrame#navPill { background:rgba(218,170,70,50); border:1px solid rgba(240,200,120,145); border-radius:9px; }
@@ -1920,6 +1930,9 @@ QCheckBox::indicator { width:16px; height:16px; border:1px solid #80653a; border
 QCheckBox::indicator:checked { background:#d4aa56; border-color:#f3d68e; }
 QSlider::groove:horizontal { height:4px; background:#39332a; border-radius:2px; }
 QSlider::handle:horizontal { width:14px; margin:-5px 0; border-radius:7px; background:#e0b65e; }
+QSlider#cellVolume::groove:vertical { width:3px; background:#514735; border-radius:1px; }
+QSlider#cellVolume::handle:vertical { height:9px; width:9px; margin:0 -3px; border-radius:4px; background:#e8c36f; border:1px solid #fff0c3; }
+QSlider#cellVolume::sub-page:vertical { background:#c69a45; border-radius:1px; }
 QProgressBar { color:#eee8da; background:#111315; border:1px solid #59472b; border-radius:6px; text-align:center; }
 QProgressBar::chunk { background:#c99a32; border-radius:5px; }
 QScrollBar:vertical { background:#111315; width:10px; }
@@ -2111,6 +2124,7 @@ signals:
     void clicked(VideoCell *cell);
     void doubleClicked(VideoCell *cell);
     void cameraDropped(VideoCell *cell, const QString &cameraId);
+    void groupDropped(VideoCell *cell, const QStringList &cameraIds);
     void cellDropped(VideoCell *cell, quintptr sourceCell);
     void contextMenuRequested(VideoCell *cell, const QPoint &globalPos);
     void addRequested(VideoCell *cell);
@@ -2281,6 +2295,7 @@ public:
     void setFillCell(bool on);                 // заполнить всю ячейку, обрезая края кадра
     void setStatusText(const QString &text);  // «Подключение…», «Нет сигнала»
     void setCameraRunning(bool running);      // фирменный индикатор запущенной камеры
+    void setCameraKey(const QString &cameraId); // ключ для сохранения масштаба между запусками
     void resetZoom();
     void clearFrame();
 
@@ -2314,6 +2329,7 @@ private:
     bool m_showTime = true;
     bool m_fillCell = false;
     bool m_cameraRunning = false;
+    QString m_cameraKey;
     int m_brightness = 0;
     qint64 m_lastFrameMs = 0;
     int m_minIntervalMs = 66;
@@ -3016,6 +3032,16 @@ inline bool isProVersion()
 QString CameraManager::add(CameraEntry e)
 {
     if (!Users::current().isAdmin()) { SecurityAudit::write(QStringLiteral("permission_denied"), QStringLiteral("camera.add")); return QString(); }
+    // Не допускаем повторное добавление одного и того же устройства.
+    const QString candidateUrl = e.url.toString(QUrl::FullyEncoded).trimmed().toLower();
+    for (const CameraEntry &existing : m_cameras) {
+        const QString existingUrl = QUrl(existing.url).toString(QUrl::FullyEncoded).trimmed().toLower();
+        if (!candidateUrl.isEmpty() && candidateUrl == existingUrl) {
+            QMessageBox::information(nullptr, T("Устройство уже добавлено"),
+                                     T("Это устройство уже есть в списке камер или регистраторов."));
+            return QString();
+        }
+    }
     if (!isProVersion() && m_cameras.size() >= 10) {
         QMessageBox::information(nullptr, T("Демо-версия"),
             T("В демо-версии можно подключить не более 10 камер. Для снятия ограничения активируйте Pro-версию в настройках."));
@@ -3036,6 +3062,29 @@ void CameraManager::addMany(QList<CameraEntry> list)
     if (!Users::current().isAdmin()) { SecurityAudit::write(QStringLiteral("permission_denied"), QStringLiteral("camera.addMany")); return; }
     if (list.isEmpty())
         return;
+
+    // Убираем дубликаты как относительно уже сохранённых устройств, так и внутри импортируемой пачки.
+    QSet<QString> knownUrls;
+    for (const CameraEntry &existing : m_cameras)
+        knownUrls.insert(QUrl(existing.url).toString(QUrl::FullyEncoded).trimmed().toLower());
+    QList<CameraEntry> uniqueList;
+    int duplicates = 0;
+    for (const CameraEntry &entry : list) {
+        const QString key = QUrl(entry.url).toString(QUrl::FullyEncoded).trimmed().toLower();
+        if (key.isEmpty() || knownUrls.contains(key)) {
+            ++duplicates;
+            continue;
+        }
+        knownUrls.insert(key);
+        uniqueList.append(entry);
+    }
+    list = uniqueList;
+    if (duplicates > 0)
+        QMessageBox::information(nullptr, T("Устройство уже добавлено"),
+                                 T("Пропущено повторных устройств: %1. Уже добавленные камеры и регистраторы не дублируются.").arg(duplicates));
+    if (list.isEmpty())
+        return;
+
     if (!isProVersion()) {
         const int available = qMax(0, 10 - m_cameras.size());
         if (available == 0) {
@@ -3789,7 +3838,7 @@ void DevicesPage::refreshStates()
             continue;
         const bool online = m_mgr->isOnline(id);
         QTableWidgetItem *link = m_table->item(row, DevColLink);
-        link->setText(online ? T("В сети") : T("Не в сети"));
+        link->setText(online ? T("● В сети") : T("● Не в сети"));
         link->setForeground(QBrush(QColor(online ? "#3fb950" : "#e8833a")));
 
         QString rec;
@@ -4787,6 +4836,23 @@ QColor liveStateColor(const CameraManager *mgr, const QString &id)
 
 } // namespace
 
+static QIcon makeArchiveToolbarIcon()
+{
+    QPixmap pm(32, 32);
+    pm.fill(Qt::transparent);
+    QPainter p(&pm);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setPen(QPen(QColor("#e8bd58"), 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    p.setBrush(Qt::NoBrush);
+    p.drawRoundedRect(QRectF(4, 6, 24, 22), 4, 4);
+    p.drawLine(4, 12, 28, 12);
+    p.drawLine(11, 17, 21, 17);
+    p.drawLine(11, 21, 21, 21);
+    p.drawLine(16, 2, 16, 8);
+    p.drawPolyline(QPolygonF{QPointF(12, 5), QPointF(16, 9), QPointF(20, 5)});
+    return QIcon(pm);
+}
+
 LiveViewPage::LiveViewPage(CameraManager *mgr, QWidget *parent) : QWidget(parent), m_mgr(mgr)
 {
     auto *root = new QHBoxLayout(this);
@@ -4888,7 +4954,9 @@ LiveViewPage::LiveViewPage(CameraManager *mgr, QWidget *parent) : QWidget(parent
     tools->addWidget(refreshBtn);
 
     auto *archiveBtn = new QToolButton(center);
-    archiveBtn->setText(T("▣  Архив"));
+    archiveBtn->setText(T("Архив"));
+    archiveBtn->setIcon(makeArchiveToolbarIcon());
+    archiveBtn->setIconSize(QSize(20, 20));
     archiveBtn->setToolTip(T("Открыть архив записей выбранной камеры"));
     archiveBtn->setCursor(Qt::PointingHandCursor);
     archiveBtn->setMinimumHeight(34);
@@ -5728,32 +5796,17 @@ MainWindow::MainWindow(CameraManager *mgr, QWidget *parent) : QMainWindow(parent
     statusBar()->addPermanentWidget(new QWidget(this), 1);   // растягивающийся пустой блок слева
     auto *editionFooter = new QLabel(this);
     editionFooter->setObjectName(QStringLiteral("editionFooter"));
-    editionFooter->setStyleSheet(QStringLiteral("color:#ff4d4f;font-size:13px;font-weight:900;padding:0 12px;letter-spacing:0.4px;"));
+    editionFooter->setStyleSheet(QStringLiteral("color:#ff4d4f;font-size:12px;font-weight:600;padding:0 12px;letter-spacing:0.25px;"));
     auto refreshEditionFooter = [editionFooter] {
         const bool pro = isProVersion();
         editionFooter->setText(pro ? T("Pro версия") : T("DEMO ВЕРСИЯ"));
         editionFooter->setStyleSheet(pro
             ? QStringLiteral("color:#e5c45a;font-size:12px;font-weight:800;padding:0 12px;")
-            : QStringLiteral("color:#ff4548;font-size:13px;font-weight:900;padding:0 12px;letter-spacing:0.4px;"));
+            : QStringLiteral("color:#ff4548;font-size:12px;font-weight:600;padding:0 12px;letter-spacing:0.25px;"));
     };
     refreshEditionFooter();
-    auto *demoPulse = new QTimer(editionFooter);
-    demoPulse->setInterval(140);
-    auto *demoPhase = new int(0);
-    QObject::connect(demoPulse, &QTimer::timeout, editionFooter, [editionFooter, demoPhase] {
-        *demoPhase = (*demoPhase + 5) % 360;
-        const QColor glow = QColor::fromHsv((355 + (*demoPhase % 6)) % 360, 210, 255);
-        editionFooter->setStyleSheet(QStringLiteral(
-            "color:%1;font-size:13px;font-weight:900;padding:0 12px;letter-spacing:1px;")
-            .arg(glow.name()));
-    });
-    auto updateDemoAnimation = [demoPulse, refreshEditionFooter] {
-        refreshEditionFooter();
-        if (!isProVersion() && Cfg::view().animations) demoPulse->start();
-        else demoPulse->stop();
-    };
-    updateDemoAnimation();
-    QObject::connect(Cfg::notifier(), &CfgNotifier::changed, editionFooter, updateDemoAnimation);
+    // Demo badge is intentionally static: no pulsing, hue cycling or animation.
+    QObject::connect(Cfg::notifier(), &CfgNotifier::changed, editionFooter, refreshEditionFooter);
     statusBar()->addPermanentWidget(editionFooter);
     // Голосовое управление работает через встроенный в Windows движок System.Speech.
     m_voiceButton = new QPushButton(T("🎙 Голос"), this);
@@ -6585,6 +6638,7 @@ PlaybackPage::PlaybackPage(CameraManager *mgr, QWidget *parent) : QWidget(parent
 
     // ---- правая часть: видео и управление ----
     m_video = new QVideoWidget(this);
+    m_video->setToolTip(T("Двойной щелчок — открыть или закрыть полноэкранный просмотр"));
     m_video->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
     m_player = new QMediaPlayer(this);
     m_audio = new QAudioOutput(this);
@@ -6601,14 +6655,15 @@ PlaybackPage::PlaybackPage(CameraManager *mgr, QWidget *parent) : QWidget(parent
     controls->addWidget(m_slider, 1);
     controls->addWidget(m_time);
 
-    auto *right = new QVBoxLayout;
-    right->addWidget(m_video, 1);
-    right->addLayout(controls);
+    m_videoLayout = new QVBoxLayout;
+    m_videoLayout->addWidget(m_video, 1);
+    m_videoLayout->addLayout(controls);
+    m_video->installEventFilter(this);
 
     auto *root = new QHBoxLayout(this);
     root->setContentsMargins(12, 12, 12, 12);
     root->addWidget(leftBox);
-    root->addLayout(right, 1);
+    root->addLayout(m_videoLayout, 1);
 
     // ---- сигналы ----
     connect(m_mgr, &CameraManager::camerasChanged, this, &PlaybackPage::reloadCameras);
@@ -6675,6 +6730,36 @@ PlaybackPage::PlaybackPage(CameraManager *mgr, QWidget *parent) : QWidget(parent
     });
 
     reloadCameras();
+}
+
+bool PlaybackPage::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched == m_video && event->type() == QEvent::MouseButtonDblClick) {
+        if (!m_videoFullscreen) {
+            auto *dialog = new QDialog(this, Qt::Window);
+            dialog->setWindowTitle(T("Архив — полноэкранный просмотр"));
+            dialog->setAttribute(Qt::WA_DeleteOnClose);
+            auto *layout = new QVBoxLayout(dialog);
+            layout->setContentsMargins(0, 0, 0, 0);
+            m_videoLayout->removeWidget(m_video);
+            m_video->setParent(dialog);
+            layout->addWidget(m_video);
+            m_videoFullscreen = dialog;
+            connect(dialog, &QDialog::finished, this, [this, dialog] {
+                if (m_video) {
+                    m_video->setParent(this);
+                    m_videoLayout->insertWidget(0, m_video, 1);
+                }
+                m_videoFullscreen = nullptr;
+                dialog->deleteLater();
+            });
+            dialog->showFullScreen();
+        } else {
+            m_videoFullscreen->close();
+        }
+        return true;
+    }
+    return QWidget::eventFilter(watched, event);
 }
 
 void PlaybackPage::showEvent(QShowEvent *e)
@@ -10413,7 +10498,7 @@ SideNav::SideNav(QWidget *parent) : QWidget(parent)
     m_brandIcon->setToolTip(App::title());
     m_brand = new QLabel(QStringLiteral("PSVMS"), this);
     m_brand->setObjectName(QStringLiteral("navBrand"));
-    m_brand->setStyleSheet(QStringLiteral("font-size:20px;font-weight:900;letter-spacing:1.4px;color:#f2d36b;"));
+    m_brand->setStyleSheet(QStringLiteral("font-size:20px;font-weight:600;letter-spacing:1.2px;color:#f2d36b;"));
     m_brand->setToolTip(App::title());
     head->addWidget(m_brandIcon);
     head->addWidget(m_brand);
@@ -11034,7 +11119,7 @@ void CameraStatusDialog::rebuild()
         const int row = m_table->rowCount();
         m_table->insertRow(row);
         const QString rec = m_mgr->isStarted(e.id) ? stateText(m_mgr->stateOf(e.id)) : T("Не запущена");
-        const QString cells[5] = {e.name, e.group, QUrl(e.url).host(), online ? T("В сети") : T("Не в сети"), rec};
+        const QString cells[5] = {e.name, e.group, QUrl(e.url).host(), online ? T("● В сети") : T("● Не в сети"), rec};
         for (int c = 0; c < 5; ++c) {
             auto *it = new QTableWidgetItem(cells[c]);
             if (c == 0)
@@ -11177,7 +11262,7 @@ void TopBar::updateModeButton()
 VideoCell::VideoCell(QWidget *parent) : QFrame(parent)
 {
     setAcceptDrops(true);
-    setCursor(Qt::OpenHandCursor);
+    setCursor(Qt::ArrowCursor);
 
     // ---- заголовок ----
     m_bar = new QWidget(this);
@@ -11196,16 +11281,16 @@ VideoCell::VideoCell(QWidget *parent) : QFrame(parent)
     m_audioBtn->setObjectName(QStringLiteral("cellBtn"));
     m_audioBtn->setToolTip(T("Включить или выключить звук"));
     m_audioBtn->setIconSize(QSize(18, 18));
-    m_volumeSlider = new QSlider(Qt::Horizontal, m_bar);
+    m_volumeSlider = new QSlider(Qt::Vertical, m_bar);
     m_volumeSlider->setObjectName(QStringLiteral("cellVolume"));
     m_volumeSlider->setRange(0, 100);
     m_volumeSlider->setValue(70);
-    m_volumeSlider->setMinimumWidth(38);
-    m_volumeSlider->setMaximumWidth(68);
-    m_volumeSlider->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
-    m_volumeSlider->setFixedHeight(14);
-    m_volumeSlider->setToolTip(T("Громкость звука камеры — можно настроить заранее"));
+    m_volumeSlider->setFixedSize(14, 42);
+    m_volumeSlider->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    m_volumeSlider->setCursor(Qt::SizeVerCursor);
+    m_volumeSlider->setToolTip(T("Вертикальная регулировка громкости"));
     m_volumeSlider->setEnabled(true);
+    m_volumeSlider->setVisible(false);
     m_closeBtn = new QToolButton(m_bar);
     m_closeBtn->setObjectName(QStringLiteral("cellBtn"));
     m_closeBtn->setIcon(makeCellIcon(QStringLiteral("close")));
@@ -11360,11 +11445,13 @@ void VideoCell::setCamera(const QString &id, const QString &title, const QUrl &u
 {
     m_cameraId = id;
     m_url = url;
+    m_surface->setCameraKey(id);
     setViewOptions(title, showTime, brightness);
     setMuted(!audio);
     setFillCell(fillCell);
     m_audioBtn->setVisible(true);
     m_closeBtn->setVisible(true);
+    m_volumeSlider->setVisible(autoplay);
     if (autoplay)
         startPlayback();
     else
@@ -11391,6 +11478,7 @@ void VideoCell::startPlayback()
     if (m_cameraId.isEmpty())
         return;
     m_started = true;
+    if (m_volumeSlider) m_volumeSlider->setVisible(true);
     m_surface->setCameraRunning(true);
     m_stack->setCurrentWidget(m_surface);
     m_surface->setStatusText(T("Подключение…"));
@@ -11401,6 +11489,7 @@ void VideoCell::startPlayback()
 void VideoCell::stopPlayback()
 {
     m_started = false;
+    if (m_volumeSlider) m_volumeSlider->setVisible(false);
     m_surface->setCameraRunning(false);
     m_retry->stop();
     hideAuthPrompt();
@@ -11416,6 +11505,7 @@ void VideoCell::stopPlayback()
 void VideoCell::clear(bool notify)
 {
     m_started = false;
+    if (m_volumeSlider) m_volumeSlider->setVisible(false);
     m_surface->setCameraRunning(false);
     m_retry->stop();
     hideAuthPrompt();
@@ -11827,7 +11917,7 @@ void VideoCell::contextMenuEvent(QContextMenuEvent *e)
 void VideoCell::dragEnterEvent(QDragEnterEvent *e)
 {
     const QMimeData *m = e->mimeData();
-    if (m->hasFormat(QString::fromLatin1(kCameraMime)) || m->hasFormat(QString::fromLatin1(kCellMime))) {
+    if (m->hasFormat(QString::fromLatin1(kCameraMime)) || m->hasFormat(QString::fromLatin1(kGroupMime)) || m->hasFormat(QString::fromLatin1(kCellMime))) {
         e->acceptProposedAction();
         setDropTarget(true);
     }
@@ -11848,6 +11938,10 @@ void VideoCell::dropEvent(QDropEvent *e)
         e->acceptProposedAction();
         if (src != reinterpret_cast<quintptr>(this))
             emit cellDropped(this, src);
+    } else if (m->hasFormat(QString::fromLatin1(kGroupMime))) {
+        e->acceptProposedAction();
+        const QStringList ids = QString::fromUtf8(m->data(QString::fromLatin1(kGroupMime))).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+        emit groupDropped(this, ids);
     } else if (m->hasFormat(QString::fromLatin1(kCameraMime))) {
         e->acceptProposedAction();
         emit cameraDropped(this, QString::fromUtf8(m->data(QString::fromLatin1(kCameraMime))));
@@ -11965,9 +12059,33 @@ void VideoGrid::ensureCells(int n)
         connect(cell, &VideoCell::clicked, this, &VideoGrid::select);
         connect(cell, &VideoCell::doubleClicked, this, &VideoGrid::openFullscreen);
         connect(cell, &VideoCell::cameraDropped, this, [this](VideoCell *c, const QString &id) {
+            if (cameraIds().contains(id)) {
+                emit message(T("Устройство уже добавлено в видеосетку."));
+                return;
+            }
             placeCamera(c, id, true);
             select(c);
             c->flash();
+            saveSoon();
+        });
+        connect(cell, &VideoCell::groupDropped, this, [this](VideoCell *target, const QStringList &ids) {
+            int start = m_cells.indexOf(target);
+            if (start < 0) return;
+            QSet<QString> already;
+            for (const QString &id : cameraIds()) if (!id.isEmpty()) already.insert(id);
+            int placed = 0, duplicates = 0;
+            for (const QString &id : ids) {
+                if (already.contains(id)) { ++duplicates; continue; }
+                int dst = start + placed;
+                while (dst < m_count && !m_cells.at(dst)->isEmpty()) ++dst;
+                if (dst >= m_count) break;
+                placeCamera(m_cells.at(dst), id, true);
+                already.insert(id);
+                m_cells.at(dst)->flash();
+                ++placed;
+            }
+            if (duplicates) emit message(T("Часть камер уже размещена в ячейках и была пропущена: %1.").arg(duplicates));
+            if (placed) { select(m_cells.at(qMin(start + placed - 1, m_count - 1))); saveLayoutNow(); }
         });
         connect(cell, &VideoCell::cellDropped, this, [this](VideoCell *c, quintptr src) {
             for (VideoCell *o : std::as_const(m_cells)) {
@@ -12082,8 +12200,16 @@ QUrl VideoGrid::urlFor(const CameraEntry &e, const VideoCell *) const
 void VideoGrid::placeCamera(VideoCell *cell, const QString &cameraId, bool autoplay)
 {
     const CameraEntry *e = m_mgr->find(cameraId);
-    if (!e)
+    if (!e || !cell)
         return;
+    // Защита на уровне общей операции назначения: один ID не может оказаться
+    // одновременно в двух ячейках, независимо от способа добавления.
+    for (VideoCell *other : std::as_const(m_cells)) {
+        if (other != cell && other->cameraId() == cameraId) {
+            emit message(T("Устройство уже добавлено в другую ячейку."));
+            return;
+        }
+    }
     cell->setCamera(e->id, e->name, urlFor(*e, cell), autoplay, e->showTime, e->brightness, e->audio, e->fillCell);
 }
 
@@ -12682,9 +12808,29 @@ void VideoSurface::setLinkQuality(LinkQuality q)
     update();
 }
 
+void VideoSurface::setCameraKey(const QString &cameraId)
+{
+    m_cameraKey = cameraId;
+    const QRectF saved = QSettings().value(QStringLiteral("cameraZoom/") + m_cameraKey).toRectF();
+    if (!m_cameraKey.isEmpty() && saved.isValid() && saved.width() > 0.0
+        && saved.height() > 0.0 && saved.width() <= 1.0 && saved.height() <= 1.0
+        && saved.x() >= 0.0 && saved.y() >= 0.0
+        && saved.right() <= 1.0001 && saved.bottom() <= 1.0001) {
+        m_view = saved;
+    } else {
+        m_view = QRectF(0.0, 0.0, 1.0, 1.0);
+    }
+    update();
+}
+
 void VideoSurface::resetZoom()
 {
     m_view = QRectF(0.0, 0.0, 1.0, 1.0);
+    if (!m_cameraKey.isEmpty()) {
+        QSettings settings;
+        settings.remove(QStringLiteral("cameraZoom/") + m_cameraKey);
+        settings.sync();
+    }
     update();
 }
 
@@ -12906,6 +13052,11 @@ void VideoSurface::wheelEvent(QWheelEvent *e)
     const double x = qBound(0.0, cx - fx * w, 1.0 - w);     // точка под курсором остаётся на месте
     const double y = qBound(0.0, cy - fy * w, 1.0 - w);
     m_view = QRectF(x, y, w, w);
+    if (!m_cameraKey.isEmpty()) {
+        QSettings settings;
+        settings.setValue(QStringLiteral("cameraZoom/") + m_cameraKey, m_view);
+        settings.sync();
+    }
     update();
     e->accept();
 }
@@ -12934,6 +13085,13 @@ void VideoSurface::mouseMoveEvent(QMouseEvent *e)
         const double dy = (e->pos().y() - m_panStart.y()) / dst.height() * m_panView.height();
         const double w = m_panView.width();
         m_view = QRectF(qBound(0.0, m_panView.x() - dx, 1.0 - w), qBound(0.0, m_panView.y() - dy, 1.0 - w), w, w);
+        // Сохраняем не только коэффициент увеличения, но и смещение кадра
+        // после перемещения мышью. Настройки привязаны к ID камеры.
+        if (!m_cameraKey.isEmpty()) {
+            QSettings settings;
+            settings.setValue(QStringLiteral("cameraZoom/") + m_cameraKey, m_view);
+            settings.sync();
+        }
         update();
     }
     QWidget::mouseMoveEvent(e);
